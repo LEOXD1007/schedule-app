@@ -1,5 +1,5 @@
 /* 日程 PWA service worker: network-first with cache fallback for offline use */
-var CACHE = 'schedule-app-v1';
+var CACHE = 'schedule-app-v2';
 var ASSETS = ['./', './index.html', './manifest.json', './apple-touch-icon.png', './icon-512.png'];
 self.addEventListener('install', function (e) {
   e.waitUntil(caches.open(CACHE).then(function (c) { return c.addAll(ASSETS); }).then(function () { return self.skipWaiting(); }));
@@ -21,10 +21,32 @@ self.addEventListener('fetch', function (e) {
     })
   );
 });
+self.addEventListener('push', function (e) {
+  e.waitUntil(Promise.resolve().then(function () {
+    if (!e.data) return {};
+    try { return Promise.resolve(e.data.json()); }
+    catch (err) {
+      try { return Promise.resolve(e.data.text()); }
+      catch (err2) { return {}; }
+    }
+  }).then(function (payload) {
+    var data = payload && typeof payload === 'object' ? payload : { title: '日程', body: String(payload || '') };
+    return self.registration.showNotification(data.title || '日程', {
+      body: data.body || '',
+      tag: data.tag || 'schedule-reminder',
+      icon: 'icon-512.png',
+      data: { url: data.url || './index.html' }
+    });
+  }));
+});
 self.addEventListener('notificationclick', function (e) {
   e.notification.close();
-  e.waitUntil(self.clients.matchAll({ type: 'window' }).then(function (cs) {
-    if (cs.length) return cs[0].focus();
-    return self.clients.openWindow('./index.html');
+  var target = (e.notification.data && e.notification.data.url) || './index.html';
+  e.waitUntil(self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then(function (cs) {
+    var scope = self.registration.scope;
+    for (var i = 0; i < cs.length; i++) {
+      if (cs[i].url.indexOf(scope) === 0 && 'focus' in cs[i]) return cs[i].focus();
+    }
+    if (self.clients.openWindow) return self.clients.openWindow(target);
   }));
 });

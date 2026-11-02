@@ -215,6 +215,7 @@ aside{display:flex;flex-direction:column;gap:12px}
         <button class="btn" id="exportBtn">导出 JSON</button>
         <button class="btn" id="importBtn">导入 JSON</button>
         <button class="btn" id="notifBtn">开启提醒通知</button>
+        <button class="btn" id="pushBtn">开启后台提醒</button>
       </div>
       <input type="file" id="file" accept="application/json,.json" class="hide">
       <div class="note" id="notifNote"></div>
@@ -260,7 +261,13 @@ aside{display:flex;flex-direction:column;gap:12px}
 <script>
 (function(){
 'use strict';
-var KEY='schedule-app.events.v1', NKEY='schedule-app.notified.v1', VKEY='schedule-app.view.v1';
+/* 后台提醒配置。部署 worker/ 后填写，说明见 README「后台提醒」。 */
+var PUSH_CONFIG={
+  workerUrl:'',
+  vapidPublicKey:'',
+  appToken:''
+};
+var KEY='schedule-app.events.v1', NKEY='schedule-app.notified.v1', VKEY='schedule-app.view.v1', PUSH_KEY='schedule-app.push.v1';
 var CATS=[{id:'work',name:'工作',v:'--c-work'},{id:'life',name:'生活',v:'--c-life'},{id:'study',name:'学习',v:'--c-study'},{id:'other',name:'其他',v:'--c-other'}];
 var WD=['一','二','三','四','五','六','日'];
 var $=function(id){return document.getElementById(id)};
@@ -268,6 +275,8 @@ function load(k,d){try{var v=JSON.parse(localStorage.getItem(k));return v==null?
 function save(k,v){try{localStorage.setItem(k,JSON.stringify(v))}catch(e){toast('保存失败：存储空间不可用')}}
 var events=load(KEY,[]); if(!Array.isArray(events))events=[];
 var notified=load(NKEY,{});
+var pushPref=load(PUSH_KEY,{enabled:false,synced:false});
+if(!pushPref||typeof pushPref!=='object')pushPref={enabled:false,synced:false};
 var hidden={};
 var state={view:load(VKEY,'month'),cursor:today(),sel:today(),q:''};
 if(['month','week','day','agenda'].indexOf(state.view)<0)state.view='month';
@@ -290,7 +299,7 @@ function onDate(s){return events.filter(function(e){return e.date===s&&visible(e
 function timeLabel(e){return e.allDay?'全天':(e.start+(e.end?' – '+e.end:''))}
 function fmtDate(s){var d=parse(s);return (d.getMonth()+1)+'月'+d.getDate()+'日 '+wdName(s)}
 function rel(s){var t=today();if(s===t)return '今天';if(s===addDays(t,1))return '明天';if(s===addDays(t,2))return '后天';return ''}
-function persist(){save(KEY,events)}
+function persist(){save(KEY,events);schedulePushSync()}
 function toast(m){var t=$('toast');t.textContent=m;t.classList.add('on');clearTimeout(toast._t);toast._t=setTimeout(function(){t.classList.remove('on')},2200)}
 
 /* ---------- rendering ---------- */
@@ -527,13 +536,40 @@ $('file').addEventListener('change',function(){
 /* ---------- reminders ---------- */
 var hasN='Notification' in window;
 var standalone=window.navigator.standalone===true||(window.matchMedia&&matchMedia('(display-mode: standalone)').matches);
-var isIOS=/iPhone|iPad|iPod/.test(navigator.userAgent);
+var isIOS=/iPhone|iPad|iPod/.test(navigator.userAgent)||(navigator.platform==='MacIntel'&&navigator.maxTouchPoints>1);
+function iosVersion(){
+  var m=(navigator.userAgent||'').match(/OS (\d+)[_.](\d+)/);
+  return m?{major:+m[1],minor:+m[2]}:null;
+}
+function pushBlockReason(){
+  var ver=iosVersion();
+  if(isIOS&&ver&&(ver.major<16||(ver.major===16&&ver.minor<4))) return '系统版本过低：关闭应用后的提醒需要 iOS 16.4 或更高版本。';
+  if(isIOS&&!standalone) return '请先点「分享 → 添加到主屏幕」，再从主屏幕图标打开。iPhone 只有这样（iOS 16.4+）才能在应用关闭后收到提醒。';
+  if(!('serviceWorker' in navigator)||!('PushManager' in window)||!hasN) return '当前浏览器不支持后台推送，提醒只在页面打开时显示。';
+  if(!window.isSecureContext) return '后台提醒需要通过 HTTPS 打开。';
+  return '';
+}
+function workerBase(){
+  var u=String(PUSH_CONFIG.workerUrl||'').trim().replace(/\/+$/,'');
+  if(/^https:\/\/[^/]+/.test(u)) return u;
+  if(/^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(u)) return u;
+  return '';
+}
+function pushConfigured(){return !!(workerBase()&&PUSH_CONFIG.vapidPublicKey)}
+function pushActive(){return !!(pushPref.enabled&&pushPref.synced)}
 function notifState(){
-  var n=$('notifNote'),b=$('notifBtn');
-  if(!hasN){b.classList.add('hide');n.textContent=isIOS&&!standalone?'iPhone 上需先「分享 → 添加到主屏幕」，从主屏幕打开（iOS 16.4+）后才能开启通知。提醒仅在应用打开时触发。':'当前浏览器不支持通知，提醒将以页面内弹窗显示（仅在页面打开时）。';return}
-  if(Notification.permission==='granted'){b.classList.add('hide');n.textContent='通知已开启。提醒仅在本页面/应用打开时触发，关闭后不会推送。'}
-  else if(Notification.permission==='denied'){b.classList.add('hide');n.textContent='通知已被拒绝，可在系统设置中重新允许。提醒将以页面内弹窗显示。'}
-  else{b.classList.remove('hide');n.textContent='开启后，在日程开始前按设定时间提醒（需保持页面打开）。'}
+  var n=$('notifNote'),b=$('notifBtn'),pb=$('pushBtn');
+  if(pb){pb.textContent=pushPref.enabled?'关闭后台提醒':'开启后台提醒';pb.classList.toggle('primary',!pushPref.enabled)}
+  var block=pushBlockReason();
+  if(block){n.textContent=block+' 页面打开时仍会本地提醒。'}
+  else if(!pushConfigured()) n.textContent='后台提醒尚未配置：在 index.html 顶部的 PUSH_CONFIG 填入 Worker 地址和 VAPID 公钥（见 README）。未配置时，提醒只在页面打开时出现。';
+  else if(pushPref.enabled&&pushPref.synced) n.textContent='后台提醒已开启。应用关闭后也会推送（大约每分钟检查一次，可能晚一分钟内；全天日程按本地时间 9:00 起算）。页面打开时不再重复弹出。';
+  else if(pushPref.enabled) n.textContent='后台提醒已打开，但还没和服务器同步成功。页面打开时仍会本地提醒。请检查网络、Worker 地址或 APP_TOKEN。';
+  else if(!hasN) n.textContent='当前浏览器不支持系统通知，提醒只在页面内显示（需保持页面打开）。';
+  else if(Notification.permission==='granted') n.textContent='通知权限已允许。开启后台提醒后，关闭应用也能收到；不开启则只在页面打开时提醒。';
+  else if(Notification.permission==='denied') n.textContent='通知已被拒绝，可在系统设置中重新允许。目前只会在页面内提示。';
+  else n.textContent='「开启提醒通知」只在页面打开时提醒。「开启后台提醒」可在关闭应用后推送（iPhone 需从主屏幕打开，iOS 16.4+）。';
+  if(b) b.classList.toggle('hide',!hasN||Notification.permission!=='default');
 }
 function askNotif(){if(!hasN)return;try{var p=Notification.requestPermission(notifState);if(p&&p.then)p.then(notifState)}catch(e){}}
 var asked=false;function maybeAskNotif(){if(!asked&&hasN&&Notification.permission==='default'){asked=true;askNotif()}}
@@ -549,26 +585,127 @@ function fire(e){
   if(!shown&&document.visibilityState==='visible'){try{navigator.vibrate&&navigator.vibrate(200)}catch(err){}}
 }
 function checkReminders(){
-  var now=Date.now(),changed=false;
+  var now=Date.now(),changed=false,background=pushActive();
   events.forEach(function(e){
     if(e.reminder==null||e.reminder<0)return;
     var d=parse(e.date),st=e.allDay?9*60:mins(e.start);d.setMinutes(st);
     var at=d.getTime()-e.reminder*60000,key=e.id+'@'+e.date+(e.allDay?'':e.start)+'#'+e.reminder;
     if(notified[e.id]===key)return;
-    if(now>=at&&now-at<10*60000){notified[e.id]=key;changed=true;fire(e)}
+    if(now>=at&&now-at<10*60000){notified[e.id]=key;changed=true;if(!background)fire(e)}
   });
   if(changed)save(NKEY,notified);
 }
+function fireAtOf(e){
+  var d=parse(e.date),st=e.allDay?9*60:mins(e.start||'09:00');
+  d.setMinutes(st);
+  return d.getTime()-(+e.reminder||0)*60000;
+}
+function collectReminders(){
+  var cutoff=Date.now()-20*60000,out=[];
+  events.forEach(function(e){
+    if(!e||e.reminder==null||+e.reminder<0||!e.id||!e.title||!e.date) return;
+    var at=fireAtOf(e);
+    if(!(at>=cutoff)) return;
+    out.push({id:String(e.id),title:String(e.title).slice(0,100),body:(timeLabel(e)+(e.location?' · '+e.location:'')).slice(0,180),fireAt:at,date:e.date,allDay:!!e.allDay,start:e.allDay?'':(e.start||''),reminder:+e.reminder});
+  });
+  return out;
+}
+function pushHeaders(){
+  var h={'Content-Type':'application/json'};
+  var token=String(PUSH_CONFIG.appToken||'').trim();
+  if(token) h.Authorization='Bearer '+token;
+  return h;
+}
+function b64urlToBytes(s){
+  s=String(s||'').replace(/\s+/g,'');
+  var pad='='.repeat((4-(s.length%4))%4);
+  var bin=atob(String(s+pad).replace(/-/g,'+').replace(/_/g,'/'));
+  var out=new Uint8Array(bin.length);
+  for(var i=0;i<bin.length;i++) out[i]=bin.charCodeAt(i);
+  return out;
+}
+function syncPush(){
+  if(!pushPref.enabled||!pushConfigured()||!('serviceWorker' in navigator)||!('PushManager' in window)) return Promise.resolve(false);
+  return navigator.serviceWorker.ready.then(function(reg){return reg.pushManager.getSubscription()}).then(function(sub){
+    if(!sub){pushPref.synced=false;save(PUSH_KEY,pushPref);return false}
+    return fetch(workerBase()+'/api/sync',{method:'POST',headers:pushHeaders(),body:JSON.stringify({subscription:sub.toJSON(),reminders:collectReminders()})}).then(function(r){
+      pushPref.synced=!!r.ok;save(PUSH_KEY,pushPref);return !!r.ok;
+    });
+  }).catch(function(){pushPref.synced=false;save(PUSH_KEY,pushPref);return false});
+}
+var pushSyncTimer=null;
+function schedulePushSync(){
+  if(!pushPref.enabled||!pushConfigured()) return;
+  clearTimeout(pushSyncTimer);
+  pushSyncTimer=setTimeout(function(){syncPush().then(function(){notifState()})},400);
+}
+function requestNotifPermission(){
+  return new Promise(function(resolve,reject){
+    var settled=false;
+    function done(v){if(settled)return;settled=true;resolve(v)}
+    try{
+      var p=Notification.requestPermission(done);
+      if(p&&typeof p.then==='function') p.then(done,reject);
+    }catch(err){reject(err)}
+  });
+}
+function ensureSubscription(reg){
+  var opts={userVisibleOnly:true,applicationServerKey:b64urlToBytes(PUSH_CONFIG.vapidPublicKey)};
+  return reg.pushManager.getSubscription().then(function(existing){
+    if(existing) return existing;
+    return reg.pushManager.subscribe(opts);
+  }).catch(function(){
+    return reg.pushManager.getSubscription().then(function(old){
+      var drop=old?old.unsubscribe():Promise.resolve();
+      return drop.then(function(){return reg.pushManager.subscribe(opts)});
+    });
+  });
+}
+function enablePush(){
+  var block=pushBlockReason();
+  if(block){toast(block);notifState();return}
+  if(!pushConfigured()){toast('请先在 PUSH_CONFIG 填写 Worker 地址和 VAPID 公钥');notifState();return}
+  requestNotifPermission().then(function(p){
+    if(p!=='granted'){toast('需要允许通知才能开启后台提醒');notifState();return}
+    return navigator.serviceWorker.ready.then(ensureSubscription).then(function(sub){
+      return fetch(workerBase()+'/api/subscribe',{method:'POST',headers:pushHeaders(),body:JSON.stringify({subscription:sub.toJSON()})}).then(function(r){
+        if(!r.ok) throw new Error('subscribe');
+        pushPref.enabled=true;pushPref.synced=false;save(PUSH_KEY,pushPref);
+        return syncPush();
+      });
+    }).then(function(ok){toast(ok?'后台提醒已开启':'已订阅，但同步日程失败');notifState()});
+  }).catch(function(){toast('开启后台提醒失败');notifState()});
+}
+function disablePush(){
+  var finish=function(){pushPref={enabled:false,synced:false};save(PUSH_KEY,pushPref);toast('已关闭后台提醒，页面打开时仍会本地提醒');notifState()};
+  if(!('serviceWorker' in navigator)){finish();return}
+  navigator.serviceWorker.ready.then(function(reg){return reg.pushManager.getSubscription()}).then(function(sub){
+    var endpoint=sub&&sub.endpoint;
+    var drop=sub?sub.unsubscribe():Promise.resolve();
+    return drop.catch(function(){}).then(function(){
+      if(!endpoint||!pushConfigured()) return;
+      return fetch(workerBase()+'/api/subscribe',{method:'DELETE',headers:pushHeaders(),body:JSON.stringify({endpoint:endpoint})}).catch(function(){});
+    });
+  }).then(finish,finish);
+}
+$('pushBtn').onclick=function(){if(pushPref.enabled)disablePush();else enablePush()};
 setInterval(checkReminders,15000);
-document.addEventListener('visibilitychange',function(){if(document.visibilityState==='visible'){checkReminders();render()}});
+document.addEventListener('visibilitychange',function(){if(document.visibilityState==='visible'){checkReminders();render();schedulePushSync()}});
 // refresh "today" at midnight
 var lastDay=today();setInterval(function(){if(today()!==lastDay){lastDay=today();render()}},60000);
 window.addEventListener('resize',function(){clearTimeout(window._rz);window._rz=setTimeout(render,150)});
-window.addEventListener('storage',function(e){if(e.key===KEY){events=load(KEY,[]);render()}});
+window.addEventListener('storage',function(e){
+  if(e.key===KEY){events=load(KEY,[]);render();schedulePushSync()}
+  if(e.key===PUSH_KEY){pushPref=load(PUSH_KEY,{enabled:false,synced:false});notifState()}
+});
 
 /* ---------- service worker (only when served over http/https) ---------- */
 if('serviceWorker' in navigator&&/^https?:$/.test(location.protocol)){
-  window.addEventListener('load',function(){navigator.serviceWorker.register('sw.js').catch(function(){})});
+  window.addEventListener('load',function(){
+    navigator.serviceWorker.register('sw.js').then(function(){
+      if(pushPref.enabled) return syncPush();
+    }).then(function(){notifState()}).catch(function(){});
+  });
 }
 
 notifState();render();checkReminders();
