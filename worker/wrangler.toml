@@ -1,0 +1,20 @@
+name = "schedule-app-push"
+main = "src/index.js"
+compatibility_date = "2026-10-01"
+workers_dev = true
+
+# Every minute. Cloudflare cron uses UTC; the app sends absolute fireAt timestamps.
+[triggers]
+crons = ["* * * * *"]
+
+# Create with: npx wrangler kv namespace create REMINDERS
+# Then paste the printed id here.
+[[kv_namespaces]]
+binding = "REMINDERS"
+id = "REPLACE_WITH_KV_ID"
+
+[vars]
+# Contact URL included in the VAPID JWT. Use a real mailto: you control.
+VAPID_SUBJECT = "mailto:you@example.com"
+# Same public key as index.html PUSH_CONFIG.vapidPublicKey. Not a secret.
+VAPID_PUBLIC_KEY = ""
